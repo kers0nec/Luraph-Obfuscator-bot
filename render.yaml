@@ -1,14 +1,14 @@
 services:
   - type: web
     name: lua-obfuscator-bot
-    env: docker
+    env: python
     region: oregon
     plan: free
-    dockerfilePath: ./Dockerfile
+    buildCommand: |
+      pip install -r requirements.txt
+      apt-get update && apt-get install -y lua5.3
+    startCommand: python bot.py
     envVars:
       - key: DISCORD_TOKEN
         sync: false
-    buildCommand: |
-      docker build --build-arg PYTHON_VERSION=3.11 -t obfuscator-bot .
-    startCommand: docker run -e DISCORD_TOKEN=$DISCORD_TOKEN obfuscator-bot
     autoDeploy: true
