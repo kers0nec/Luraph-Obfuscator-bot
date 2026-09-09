@@ -7,14 +7,37 @@ import os
 import logging
 from pathlib import Path
 import asyncio
+from flask import Flask, jsonify
+import threading
 
-# Configure logging
+# ===== WEB SERVER (keeps bot alive 24/7) =====
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "online",
+        "bot": "Lua Obfuscator Bot",
+        "message": "Bot is running 24/7"
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "uptime": "running"})
+
+def run_web_server():
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
+
+# Start web server in background
+threading.Thread(target=run_web_server, daemon=True).start()
+print("✅ Web server started on port 8080")
+
+# ===== DISCORD BOT =====
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Bot setup - FIXED intents
 intents = discord.Intents.default()
-intents.message_content = True  # This is the correct intent for reading messages
+intents.message_content = True
 
 bot = commands.Bot(command_prefix='/', intents=intents)
 
@@ -132,7 +155,6 @@ async def on_ready():
 @bot.tree.command(name="obfuscate", description="Obfuscate a .lua or .txt file")
 @app_commands.describe(file="The .lua or .txt file to obfuscate")
 async def obfuscate(interaction: discord.Interaction, file: discord.Attachment = None):
-    # Check for file in command or message attachments
     if not file:
         if interaction.message and interaction.message.attachments:
             file = interaction.message.attachments[0]
