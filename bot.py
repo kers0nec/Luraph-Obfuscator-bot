@@ -1,66 +1,29 @@
+import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
 import uuid
-import time
 import os
 import logging
 from pathlib import Path
-import asyncio
 import threading
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
+
+from local_obfuscator import obfuscate_lua
 
 # =====================================================================
-# Delegate architecture (Luraph obfuscator)
+# Instant local obfuscation (no executor, no queue, no `lua` binary)
 # ---------------------------------------------------------------------
-# obfuscator.lua is a Roblox / Luau-only artifact.  It needs globals that
-# only exist inside a Roblox executor (game, buffer, Vector3, typeof,
-# setfenv, the `continue` keyword, ...).  A plain Linux host (Render) can
-# never run it — installing stock `lua` does not help.
-#
-# So this bot does NOT try to run obfuscator.lua itself.  Instead:
-#
-#   1. A user uploads a .lua/.txt file through Discord.
-#   2. This bot (hosted on Render) queues an obfuscation JOB in memory and
-#      replies once the job completes.
-#   3. A Roblox executor worker (executor_worker.lua, running on your PC
-#      inside an executor that CAN run obfuscator.lua) polls the Render
-#      HTTP endpoints below for jobs, obfuscates the code, and posts the
-#      result back here.
-#   4. The bot hands the result back to the Discord user as a file.
-#
-# The two sides share a secret (env: BRIDGE_KEY) so random people on the
-# internet can't use your executor or inject fake results.
+# /obfuscate runs a pure-Python obfuscator (local_obfuscator.py) right here
+# on Render and returns the file immediately. Nothing to install, no worker
+# to keep online, no "Queued ... waiting for the executor" delay.
 # =====================================================================
 
-# ===== WEB SERVER (HTTP bridge + keep-alive) =====
+# ===== WEB SERVER (keep-alive for Render) =====
 app = Flask(__name__)
 
-# Job store shared between the Flask (bridge) thread and the Discord async
-# handlers.  Format:
-#   JOBS[job_id] = {
-#       'status': 'queued' | 'in_progress' | 'done' | 'error',
-#       'code': str,            # original source to obfuscate
-#       'filename': str,        # original user filename
-#       'result': str | None,   # obfuscated output when done
-#       'error': str | None,    # message when failed
-#       'claimed_at': float,
-#   }
-JOBS = {}
-
-BRIDGE_KEY = os.getenv('BRIDGE_KEY', '')  # shared secret with the executor
-OBFUSCATOR_PATH = Path('obfuscator.lua')
 ALLOWED_EXTENSIONS = {'.lua', '.txt'}
 MAX_FILE_SIZE = 1_000_000
-JOB_TIMEOUT_SECONDS = 180  # how long the Discord command waits for the executor
-POP_TIMEOUT_SECONDS = 300  # how long a claimed job may be worked on
-
-
-def _authorized() -> bool:
-    """Require the X-Bridge-Key header to match BRIDGE_KEY."""
-    if not BRIDGE_KEY:
-        return False
-    return request.headers.get('X-Bridge-Key') == BRIDGE_KEY
 
 
 @app.route('/')
@@ -69,7 +32,7 @@ def home():
         'status': 'online',
         'bot': 'Lua Obfuscator Bot',
         'message': 'Bot is running 24/7',
-        'pending_jobs': sum(1 for j in JOBS.values() if j['status'] == 'queued'),
+        'mode': 'instant-local',
     })
 
 
@@ -78,80 +41,12 @@ def health():
     return jsonify({'status': 'healthy', 'uptime': 'running'})
 
 
-@app.route('/api/job/next', methods=['GET'])
-def job_next():
-    """Executor polls this to claim the next queued job."""
-    if not _authorized():
-        return jsonify({'error': 'unauthorized'}), 401
-    now = time.time()
-    # Claim the oldest queued job.
-    for job_id, job in sorted(JOBS.items(), key=lambda kv: kv[1].get('created_at', 0)):
-        if job['status'] == 'queued':
-            job['status'] = 'in_progress'
-            job['claimed_at'] = now
-            return jsonify({
-                'job_id': job_id,
-                'code': job['code'],
-                'filename': job['filename'],
-            }), 200
-        # Free up jobs claimed but abandoned by a dead executor.
-        if job['status'] == 'in_progress' and now - job.get('claimed_at', 0) > POP_TIMEOUT_SECONDS:
-            job['status'] = 'queued'
-    return jsonify({}), 204
-
-
-@app.route('/api/job/<job_id>/result', methods=['POST'])
-def job_result(job_id):
-    """Executor posts the obfuscation result here."""
-    if not _authorized():
-        return jsonify({'error': 'unauthorized'}), 401
-    job = JOBS.get(job_id)
-    if not job:
-        return jsonify({'error': 'unknown job'}), 404
-    data = request.get_json(silent=True) or {}
-    if data.get('success'):
-        job['status'] = 'done'
-        job['result'] = data.get('output', '')
-    else:
-        job['status'] = 'error'
-        job['error'] = str(data.get('error', 'Unknown executor error'))[:500]
-    return jsonify({'ok': True}), 200
-
-
-@app.route('/api/job/<job_id>', methods=['GET'])
-def job_status(job_id):
-    """Optional status check (used by the executor / debugging)."""
-    if not _authorized():
-        return jsonify({'error': 'unauthorized'}), 401
-    job = JOBS.get(job_id)
-    if not job:
-        return jsonify({'error': 'unknown job'}), 404
-    return jsonify({'job_id': job_id, 'status': job['status']}), 200
-
-
-@app.route('/api/assets/obfuscator.lua', methods=['GET'])
-def obfuscator_asset():
-    """Serves obfuscator.lua so the executor doesn't need a local copy.
-
-    The executor fetches this, then loadstring()'s it inside Roblox where
-    the required Roblox globals exist.
-    """
-    if not _authorized():
-        return jsonify({'error': 'unauthorized'}), 401
-    if not OBFUSCATOR_PATH.exists():
-        return jsonify({'error': 'obfuscator.lua not present on server'}), 500
-    return OBFUSCATOR_PATH.read_text(encoding='utf-8'), 200, {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-store',
-    }
-
-
 def run_web_server():
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
 
 
 threading.Thread(target=run_web_server, daemon=True).start()
-print("✅ Web server / obfuscation bridge started")
+print("✅ Web server started")
 
 
 # ===== DISCORD BOT =====
@@ -168,63 +63,10 @@ class ObfuscationError(Exception):
     pass
 
 
-def _queue_job(code: str, filename: str) -> str:
-    """Add a job to the queue and return its id."""
-    job_id = uuid.uuid4().hex
-    JOBS[job_id] = {
-        'status': 'queued',
-        'code': code,
-        'filename': filename,
-        'result': None,
-        'error': None,
-        'created_at': time.time(),
-        'claimed_at': None,
-    }
-    return job_id
-
-
-async def _wait_for_job(job_id: str, timeout: int = JOB_TIMEOUT_SECONDS) -> str:
-    """Wait (async, non-blocking) until the executor finishes a job.
-
-    Raises ObfuscationError on executor failure / timeout.
-    """
-    job = JOBS[job_id]
-    elapsed = 0.0
-    while job['status'] in ('queued', 'in_progress'):
-        if elapsed >= timeout:
-            # No executor finished this in time — drop it so we don't leak
-            # memory while the executor is offline.
-            JOBS.pop(job_id, None)
-            raise ObfuscationError(
-                "Timed out waiting for the obfuscation executor. "
-                "Make sure `executor_worker.lua` is running in a Roblox executor."
-            )
-        await asyncio.sleep(1.0)
-        elapsed += 1.0
-
-    if job['status'] == 'error':
-        raise ObfuscationError(job['error'] or "Executor reported a failure.")
-    if job['status'] == 'done':
-        result = job.get('result') or ''
-        if not result.strip():
-            raise ObfuscationError("Executor returned an empty result.")
-        return result
-    raise ObfuscationError("Unexpected job state.")
-
-
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot is ready! Logged in as {bot.user}")
-
-    if OBFUSCATOR_PATH.exists():
-        logger.info(f"✅ obfuscator.lua found on server ({OBFUSCATOR_PATH.stat().st_size:,} bytes)")
-    else:
-        logger.warning(f"⚠️ obfuscator.lua NOT found at {OBFUSCATOR_PATH}")
-
-    if not BRIDGE_KEY:
-        logger.warning("⚠️ BRIDGE_KEY env var not set — the executor will not be able to connect!")
-    else:
-        logger.info("✅ BRIDGE_KEY is set (executor bridge enabled)")
+    logger.info("✅ Instant local obfuscation enabled (no executor needed)")
 
     try:
         synced = await bot.tree.sync()
@@ -240,7 +82,7 @@ async def on_ready():
     )
 
 
-@bot.tree.command(name="obfuscate", description="Obfuscate a .lua or .txt file (runs via the Roblox executor)")
+@bot.tree.command(name="obfuscate", description="Obfuscate a .lua or .txt file (instant)")
 @app_commands.describe(file="The .lua or .txt file to obfuscate")
 async def obfuscate(interaction: discord.Interaction, file: discord.Attachment = None):
     if not file:
@@ -291,26 +133,17 @@ async def obfuscate(interaction: discord.Interaction, file: discord.Attachment =
             await interaction.followup.send("❌ File is empty!", ephemeral=True)
             return
 
-        if not BRIDGE_KEY:
-            await interaction.followup.send(
-                "❌ This bot isn't configured for obfuscation yet "
-                "(missing `BRIDGE_KEY` environment variable). Contact the bot owner.",
-                ephemeral=True
-            )
-            return
+        logger.info(f"Obfuscating: {file.filename} ({len(code):,} chars)")
 
-        logger.info(f"Queueing: {file.filename} ({len(code):,} chars)")
+        # Run the (CPU-bound) obfuscator off the event loop so the bot stays
+        # responsive, then reply immediately — no queue, no executor wait.
+        try:
+            obfuscated = await asyncio.to_thread(obfuscate_lua, code, file.filename)
+        except ValueError as e:
+            raise ObfuscationError(str(e))
 
-        job_id = _queue_job(code, file.filename)
         output_name = f"obfuscated_{Path(file.filename).stem}.lua"
-
-        await interaction.followup.send(
-            f"⏳ Queued `{file.filename}` for obfuscation… "
-            f"(waiting for the executor to pick it up)",
-            ephemeral=True
-        )
-
-        obfuscated = await _wait_for_job(job_id)
+        job_id = uuid.uuid4().hex
 
         # Deliver the result back as a file.
         temp = Path(f"/tmp/obf_result_{job_id}.lua")
@@ -329,9 +162,6 @@ async def obfuscate(interaction: discord.Interaction, file: discord.Attachment =
             except OSError:
                 pass
 
-        # Free memory once the user has the result.
-        JOBS.pop(job_id, None)
-
     except ObfuscationError as e:
         await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
     except Exception as e:
@@ -343,17 +173,17 @@ async def obfuscate(interaction: discord.Interaction, file: discord.Attachment =
 async def obf_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🛡️ Lua Obfuscator Bot",
-        description="Obfuscate Lua code from file attachments",
+        description="Obfuscate Lua code from file attachments — instantly, no setup needed.",
         color=0x00ff00
     )
     embed.add_field(
         name="📝 How to use",
-        value="1. Attach a `.lua` or `.txt` file\n2. Type `/obfuscate`\n3. Get obfuscated file back",
+        value="1. Attach a `.lua` or `.txt` file\n2. Type `/obfuscate`\n3. Get obfuscated file back instantly",
         inline=False
     )
     embed.add_field(
         name="⚠️ Limitations",
-        value="• Max file size: 1MB\n• Only `.lua` and `.txt`\n• Obfuscation runs through the Roblox executor (see README)",
+        value="• Max file size: 1MB\n• Only `.lua` and `.txt`\n• Output needs `loadstring`/`load` enabled where it runs (standard in executors)",
         inline=False
     )
     embed.set_footer(text="All responses are ephemeral")
@@ -364,19 +194,11 @@ async def obf_help(interaction: discord.Interaction):
 async def obf_status(interaction: discord.Interaction):
     embed = discord.Embed(title="📊 Bot Status", color=0x3498db)
 
-    obf_size = OBFUSCATOR_PATH.stat().st_size if OBFUSCATOR_PATH.exists() else None
     embed.add_field(
-        name="📁 obfuscator.lua",
-        value=f"✅ Found ({obf_size:,} bytes)" if obf_size else "❌ Not found on server",
+        name="⚡ Engine",
+        value="✅ Instant local obfuscation",
         inline=True
     )
-
-    bridge_status = "✅ Configured" if BRIDGE_KEY else "❌ Missing BRIDGE_KEY"
-    embed.add_field(name="🔗 Bridge", value=bridge_status, inline=True)
-
-    pending = sum(1 for j in JOBS.values() if j['status'] == 'queued')
-    active = sum(1 for j in JOBS.values() if j['status'] == 'in_progress')
-    embed.add_field(name="📥 Queue", value=f"{pending} waiting · {active} working", inline=True)
 
     embed.add_field(name="🤖 Bot", value=f"✅ Online\nUser: {bot.user}", inline=True)
 
