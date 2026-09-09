@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: lua-obfuscator-bot
+    env: docker
+    region: oregon
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+    autoDeploy: true
