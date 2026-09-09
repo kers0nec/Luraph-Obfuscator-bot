@@ -7,6 +7,11 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
+      # NOTE: Render ignores runtime.txt — the Python version MUST be set
+      # here (or in Dashboard → Environment for existing services).
+      # Without this, Render defaults to 3.14, which old discord.py can't run on.
+      - key: PYTHON_VERSION
+        value: 3.12.7
       - key: DISCORD_TOKEN
         sync: false
       # Shared secret between this bot and your Roblox executor worker.
