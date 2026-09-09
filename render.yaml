@@ -5,8 +5,8 @@ services:
     region: oregon
     plan: free
     buildCommand: |
-      pip install -r requirements.txt
       apt-get update && apt-get install -y lua5.3
+      pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: DISCORD_TOKEN
