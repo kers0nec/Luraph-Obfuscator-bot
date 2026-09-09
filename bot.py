@@ -12,11 +12,13 @@ from flask import Flask, jsonify
 from local_obfuscator import obfuscate_lua
 
 # =====================================================================
-# Instant local obfuscation (no executor, no queue, no `lua` binary)
+# Luraph-style multi-layer obfuscation (no executor, no queue, no `lua` binary)
 # ---------------------------------------------------------------------
-# /obfuscate runs a pure-Python obfuscator (local_obfuscator.py) right here
-# on Render and returns the file immediately. Nothing to install, no worker
-# to keep online, no "Queued ... waiting for the executor" delay.
+# /obfuscate runs a pure-Python multi-layer obfuscator (local_obfuscator.py)
+# right here on Render and returns the file immediately.
+# 3-layer encoding: XOR+shift+permutation → reverse+XOR → control-flow
+# flattened state machine, with opaque predicates, junk code, and anti-tamper.
+# Nothing to install, no worker to keep online.
 # =====================================================================
 
 # ===== WEB SERVER (keep-alive for Render) =====
@@ -30,9 +32,11 @@ MAX_FILE_SIZE = 1_000_000
 def home():
     return jsonify({
         'status': 'online',
-        'bot': 'Lua Obfuscator Bot',
+        'bot': 'Luraph Obfuscator Bot',
         'message': 'Bot is running 24/7',
-        'mode': 'instant-local',
+        'mode': 'multi-layer-local',
+        'layers': 3,
+        'features': ['XOR+shift+permutation', 'control-flow flattening', 'opaque predicates', 'anti-tamper'],
     })
 
 
@@ -66,7 +70,7 @@ class ObfuscationError(Exception):
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot is ready! Logged in as {bot.user}")
-    logger.info("✅ Instant local obfuscation enabled (no executor needed)")
+    logger.info("✅ Luraph-style multi-layer obfuscation enabled (3-layer + anti-tamper)")
 
     try:
         synced = await bot.tree.sync()
@@ -172,13 +176,24 @@ async def obfuscate(interaction: discord.Interaction, file: discord.Attachment =
 @bot.tree.command(name="obf_help", description="Show help for the obfuscator bot")
 async def obf_help(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🛡️ Lua Obfuscator Bot",
-        description="Obfuscate Lua code from file attachments — instantly, no setup needed.",
+        title="🛡️ Luraph Obfuscator Bot",
+        description="Obfuscate Lua code with multi-layer Luraph-style protection — instantly, no setup needed.",
         color=0x00ff00
     )
     embed.add_field(
         name="📝 How to use",
         value="1. Attach a `.lua` or `.txt` file\n2. Type `/obfuscate`\n3. Get obfuscated file back instantly",
+        inline=False
+    )
+    embed.add_field(
+        name="🔒 Protection layers",
+        value=(
+            "• **Layer 1**: XOR + byte-shift + permutation encoding\n"
+            "• **Layer 2**: Reverse + XOR decoder wrapping\n"
+            "• **Layer 3**: Control-flow flattened state machine\n"
+            "• Opaque predicates, junk code, anti-tamper checksums\n"
+            "• Fresh random keys/names every run"
+        ),
         inline=False
     )
     embed.add_field(
@@ -196,7 +211,13 @@ async def obf_status(interaction: discord.Interaction):
 
     embed.add_field(
         name="⚡ Engine",
-        value="✅ Instant local obfuscation",
+        value="✅ Luraph-style multi-layer obfuscator\n3-layer encoding + anti-tamper",
+        inline=True
+    )
+
+    embed.add_field(
+        name="🔒 Features",
+        value="Control-flow flattening\nOpaque predicates\nJunk code injection",
         inline=True
     )
 
