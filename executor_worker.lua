@@ -13,7 +13,7 @@
 -- ============================================================================
 
 local RENDER_URL = "https://YOUR-RENDER-SERVICE-NAME.onrender.com"  -- TODO
-local BRIDGE_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"             -- TODO (same as Render's BRIDGE_KEY)
+local BRIDGE_KEY = "12345"                                         -- same as Render's BRIDGE_KEY
 
 local HttpService = game:GetService("HttpService")
 

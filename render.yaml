@@ -15,7 +15,8 @@ services:
       - key: DISCORD_TOKEN
         sync: false
       # Shared secret between this bot and your Roblox executor worker.
-      # Set a long random value, then use the SAME value in executor_worker.lua.
+      # CURRENT VALUE: 12345  (set in Dashboard → Environment — sync:false
+      # means the blueprint can't carry the value, you must paste it there.)
       - key: BRIDGE_KEY
         sync: false
     autoDeploy: true
