@@ -12,10 +12,9 @@ import asyncio
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Bot setup
+# Bot setup - FIXED intents
 intents = discord.Intents.default()
-intents.message_content = True
-intents.attachments = True
+intents.message_content = True  # This is the correct intent for reading messages
 
 bot = commands.Bot(command_prefix='/', intents=intents)
 
@@ -133,6 +132,7 @@ async def on_ready():
 @bot.tree.command(name="obfuscate", description="Obfuscate a .lua or .txt file")
 @app_commands.describe(file="The .lua or .txt file to obfuscate")
 async def obfuscate(interaction: discord.Interaction, file: discord.Attachment = None):
+    # Check for file in command or message attachments
     if not file:
         if interaction.message and interaction.message.attachments:
             file = interaction.message.attachments[0]
