@@ -4,11 +4,13 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: |
-      apt-get update && apt-get install -y lua5.3
-      pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: DISCORD_TOKEN
+        sync: false
+      # Shared secret between this bot and your Roblox executor worker.
+      # Set a long random value, then use the SAME value in executor_worker.lua.
+      - key: BRIDGE_KEY
         sync: false
     autoDeploy: true
