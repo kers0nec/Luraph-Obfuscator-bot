@@ -20,7 +20,9 @@ Additional hardening:
 - Multi-cipher: each layer uses a different encoding scheme.
 
 Output is compatible with Lua 5.1+ / Luau / Roblox executors (uses loadstring,
-string, table, bit32 where available).
+string, table, bit32 where available; XOR is implemented portably so the
+generated code parses and runs on every target — the `~` operator is not
+used because it does not exist in Lua 5.1 / Luau).
 """
 
 from __future__ import annotations
@@ -131,7 +133,10 @@ def _make_opaque_predicate_true(rng: random.Random) -> str:
     elif kind == 1:
         return f"(({a}+{b})%2=={((a+b)%2)})"
     elif kind == 2:
-        return f"(#{'{' + ','.join(str(rng.randint(1,99)) for _ in range(rng.randint(2,5))) + '}'})>{rng.randint(0,3)})"
+        # (#{...}>1) — a table of 2-5 entries always has length >= 2, so
+        # this comparison is an opaque (guaranteed always-true) test.
+        nums = ",".join(str(rng.randint(1, 99)) for _ in range(rng.randint(2, 5)))
+        return f"(#{{{nums}}}>1)"
     else:
         return f"(string.len(\"{'x'*rng.randint(3,8)}\")>0)"
 
@@ -193,8 +198,11 @@ def _encode_layer1(source: str, rng: random.Random) -> tuple[str, dict]:
     # Encode chunks as Lua string table
     table_str = _format_string_table(chunks, _escape_bytes_lua, per_line=1)
 
-    # Build permutation table as Lua code
-    perm_str = ",".join(str(p) for p in perm)
+    # Build permutation table as Lua code.
+    # Stored 1-based: the generated decoder indexes a Lua table with it
+    # directly, and 0-based values would write to slot 0, which
+    # table.concat silently drops (lost byte).
+    perm_str = ",".join(str(p + 1) for p in perm)
 
     keys = {
         "xor_key": xor_key,
@@ -229,9 +237,31 @@ def _build_layer1_decoder(rng: random.Random, l1_keys: dict, taken: set[str]) ->
     v_fn = _rand_ident(rng, taken)
     v_err = _rand_ident(rng, taken)
     v_tmp = _rand_ident(rng, taken)
+    v_xor = _rand_ident(rng, taken)
+
+    # Portable byte XOR. The `~` operator does not exist in Lua 5.1 or Luau
+    # (the documented targets), so use bit32.bxor where available and fall
+    # back to pure arithmetic otherwise.
+    # NOTE: statements are separated by NEWLINES on purpose — the strict
+    # lexers of Lua 5.3+ reject concatenated tokens like `...p=1while...`
+    # (5.1 accepted them).
+    xor_fn = (
+        f"local {v_xor}=bit32 and bit32.bxor or function(a,b)\n"
+        "  local r=0\n"
+        "  local p=1\n"
+        "  while a>0 or b>0 do\n"
+        "    if (a%2)+(b%2)==1 then r=r+p end\n"
+        "    a=(a-a%2)/2\n"
+        "    b=(b-b%2)/2\n"
+        "    p=p*2\n"
+        "  end\n"
+        "  return r\n"
+        "end"
+    )
 
     # Use string concatenation to avoid f-string brace conflicts
     code = (
+        xor_fn + "\n"
         f"local {v_payload}=__PAYLOAD__\n"
         f"local {v_joined}=table.concat({v_payload})\n"
         f"local {v_perm}=__PERM__\n"
@@ -240,9 +270,9 @@ def _build_layer1_decoder(rng: random.Random, l1_keys: dict, taken: set[str]) ->
         f"local {v_sk}={l1_keys['shift_key']}\n"
         f"local {v_cs}={l1_keys['checksum']}\n"
         f"local {v_out}={{}}\n"
-        f"for {v_i}=1,{v_n} do {v_out}[{v_perm}[{v_i}]]=string.char(({v_joined}:byte({v_i})-{v_sk})%256) end\n"
+        f"for {v_i}=1,{v_n} do {v_out}[{v_perm}[{v_i}]]=string.char(({v_joined}:byte({v_i})+512-{v_sk})%256) end\n"
         f"local {v_decoded}=table.concat({v_out})\n"
-        f"for {v_i}=1,{v_n} do {v_out}[{v_i}]=string.char({v_out}[{v_i}]:byte()~{v_xk}) end\n"
+        f"for {v_i}=1,{v_n} do {v_out}[{v_i}]=string.char({v_xor}({v_out}[{v_i}]:byte(),{v_xk})) end\n"
         f"{v_decoded}=table.concat({v_out})\n"
         f"local {v_load}=loadstring or load\n"
         f"local {v_fn},{v_err}={v_load}({v_decoded},\"=(L)\")\n"
@@ -298,14 +328,33 @@ def _build_layer2_decoder(rng: random.Random, l2_keys: dict, taken: set[str]) ->
     v_fn = _rand_ident(rng, taken)
     v_err = _rand_ident(rng, taken)
     v_decoder = _rand_ident(rng, taken)
+    v_xor = _rand_ident(rng, taken)
+
+    # Portable byte XOR (see _build_layer1_decoder): `~` is not valid in
+    # Lua 5.1 / Luau, and statements are newline-separated because the
+    # strict Lua 5.3+ lexers reject concatenated tokens.
+    xor_fn = (
+        f"local {v_xor}=bit32 and bit32.bxor or function(a,b)\n"
+        "  local r=0\n"
+        "  local p=1\n"
+        "  while a>0 or b>0 do\n"
+        "    if (a%2)+(b%2)==1 then r=r+p end\n"
+        "    a=(a-a%2)/2\n"
+        "    b=(b-b%2)/2\n"
+        "    p=p*2\n"
+        "  end\n"
+        "  return r\n"
+        "end"
+    )
 
     code = (
+        xor_fn + "\n"
         f"local {v_payload}=__PAYLOAD2__\n"
         f"local {v_joined}=table.concat({v_payload})\n"
         f"local {v_n}=#{v_joined}\n"
         f"local {v_xk}={l2_keys['xor_key']}\n"
         f"local {v_out}={{}}\n"
-        f"for {v_i}=1,{v_n} do {v_out}[{v_n}-{v_i}+1]=string.char({v_joined}:byte({v_i})~{v_xk}) end\n"
+        f"for {v_i}=1,{v_n} do {v_out}[{v_n}-{v_i}+1]=string.char({v_xor}({v_joined}:byte({v_i}),{v_xk})) end\n"
         f"local {v_reversed}=table.concat({v_out})\n"
         f"local {v_load}=loadstring or load\n"
         f"local {v_fn},{v_err}={v_load}({v_reversed},\"=(L2)\")\n"
@@ -416,7 +465,7 @@ def _build_outer_loader(
         f"  if {v_state}=={state_init} then",
         # Decode phase
         f"    for {v_i}=1,{v_n} do",
-        f"      {v_out}[{v_i}]=string.char(({v_blob}:byte({v_i})-{v_sk})%256)",
+        f"      {v_out}[{v_i}]=string.char(({v_blob}:byte({v_i})+512-{v_sk})%256)",
         f"    end",
         f"    {v_dec}=table.concat({v_out})",
         f"    {v_state}={state_decode}",

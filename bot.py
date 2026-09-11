@@ -2,14 +2,61 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-import uuid
+import importlib
 import os
+import sys
+import uuid
 import logging
 from pathlib import Path
 import threading
 from flask import Flask, jsonify
 
-from local_obfuscator import obfuscate_lua
+
+def _import_local_obfuscator():
+    """Import local_obfuscator.py from next to bot.py, or from the first
+    parent directory that contains it.
+
+    The deployment supervisor launches `python3 -u bot.py` from an isolated
+    per-instance subdirectory (e.g. /opt/render/project/src/vps_instances/vps-xxxx/)
+    where only bot.py is copied. Python only puts the script's own directory
+    on sys.path, so a plain `from local_obfuscator import obfuscate_lua`
+    crashes with ModuleNotFoundError. Walking up the tree finds the module
+    wherever the rest of the repo lives.
+    """
+
+    def _load():
+        try:
+            module = importlib.import_module("local_obfuscator")
+        except ImportError:
+            return None
+        return module if hasattr(module, "obfuscate_lua") else None
+
+    module = _load()
+    if module is not None:
+        return module.obfuscate_lua
+
+    here = Path(__file__).resolve().parent
+    for directory in (here, *here.parents):
+        if not (directory / "local_obfuscator.py").is_file():
+            continue
+        # Drop any stale cached copy (e.g. an outdated local_obfuscator.py
+        # that exists next to bot.py but lacks obfuscate_lua).
+        sys.modules.pop("local_obfuscator", None)
+        directory_str = str(directory)
+        if directory_str not in sys.path:
+            sys.path.insert(0, directory_str)
+        module = _load()
+        if module is not None:
+            return module.obfuscate_lua
+
+    raise ImportError(
+        "local_obfuscator.py (with obfuscate_lua) was not found next to "
+        "bot.py or in any parent directory — make sure it ships with the "
+        "deployment."
+    )
+
+
+obfuscate_lua = _import_local_obfuscator()
 
 # =====================================================================
 # Luraph-style multi-layer obfuscation (no executor, no queue, no `lua` binary)
@@ -26,6 +73,13 @@ app = Flask(__name__)
 
 ALLOWED_EXTENSIONS = {'.lua', '.txt'}
 MAX_FILE_SIZE = 1_000_000
+
+# Discord rejects attachments over 25MB (non-premium). The engine expands
+# input ~170x (three encoding layers of 4-char byte escapes plus
+# permutation tables), so cap the output and refuse oversized inputs
+# early instead of burning CPU on a file that cannot be delivered.
+MAX_OUTPUT_SIZE = 20_000_000
+EST_OUTPUT_FACTOR = 175
 
 
 @app.route('/')
@@ -139,12 +193,30 @@ async def obfuscate(interaction: discord.Interaction, file: discord.Attachment =
 
         logger.info(f"Obfuscating: {file.filename} ({len(code):,} chars)")
 
+        # Cheap pre-check: refuse inputs whose estimated output would not
+        # fit in a Discord attachment, before spending CPU on them.
+        raw_len = len(code.encode('utf-8'))
+        if raw_len * EST_OUTPUT_FACTOR > MAX_OUTPUT_SIZE:
+            raise ObfuscationError(
+                f"File too large to return: ~{raw_len // 1024}KB input would "
+                f"obfuscate to ~{raw_len * EST_OUTPUT_FACTOR // 1024 // 1024}MB, "
+                "over Discord's 25MB attachment limit. "
+                f"Keep input under ~{MAX_OUTPUT_SIZE // EST_OUTPUT_FACTOR // 1024}KB."
+            )
+
         # Run the (CPU-bound) obfuscator off the event loop so the bot stays
         # responsive, then reply immediately — no queue, no executor wait.
         try:
             obfuscated = await asyncio.to_thread(obfuscate_lua, code, file.filename)
         except ValueError as e:
             raise ObfuscationError(str(e))
+
+        # Authoritative post-check on the actual output size.
+        if len(obfuscated.encode('utf-8')) > MAX_OUTPUT_SIZE:
+            raise ObfuscationError(
+                "Obfuscated output exceeds Discord's attachment limit. "
+                "Try a smaller input file."
+            )
 
         output_name = f"obfuscated_{Path(file.filename).stem}.lua"
         job_id = uuid.uuid4().hex
@@ -198,7 +270,12 @@ async def obf_help(interaction: discord.Interaction):
     )
     embed.add_field(
         name="⚠️ Limitations",
-        value="• Max file size: 1MB\n• Only `.lua` and `.txt`\n• Output needs `loadstring`/`load` enabled where it runs (standard in executors)",
+        value=(
+            f"• Input: .lua / .txt only, up to 1MB\n"
+            f"• Practical limit: ~{MAX_OUTPUT_SIZE // EST_OUTPUT_FACTOR // 1024}KB input "
+            f"(obfuscated output must fit Discord's 25MB attachment cap)\n"
+            "• Output needs `loadstring`/`load` enabled where it runs (standard in executors)"
+        ),
         inline=False
     )
     embed.set_footer(text="All responses are ephemeral")

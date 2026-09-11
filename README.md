@@ -33,7 +33,15 @@ Return values and `...` varargs are forwarded, so both Scripts and ModuleScripts
 keep working.
 
 The output only needs `string` / `table` / `loadstring` where it runs —
-available in stock Lua 5.1+ and Roblox Luau executors.
+available in stock Lua 5.1+ and Roblox Luau executors (XOR is implemented
+portably, so the generated code parses on every target).
+
+### Size limits
+
+The multi-layer encoding expands input ~170x (three layers of 4-char byte
+escapes plus permutation tables). Discord rejects attachments over 25MB
+(non-premium), so the bot refuses inputs whose output would not fit — in
+practice keep input under **~110KB**.
 
 > Note: the bundled `obfuscator.lua` is Luraph-protected **sample output**, not
 > an obfuscation engine (it needs Roblox-only globals and can't run on Render).
@@ -54,10 +62,12 @@ env var from the Render dashboard and stop running `executor_worker.lua`
 
 | File | Purpose |
 |------|---------|
-| `bot.py` | Discord bot (instant obfuscation, no queue). |
+| `bot.py` | Discord bot (instant obfuscation, no queue). Self-locates `local_obfuscator.py` even when launched from an isolated per-instance dir (e.g. `.../src/vps_instances/vps-xxxx/bot.py`). |
 | `local_obfuscator.py` | Luraph-style multi-layer Lua obfuscation engine (3-layer, anti-tamper, control-flow flattening). |
 | `render.yaml` | Render blueprint for the bot service. |
 | `obfuscator.lua` | Luraph-protected sample output — reference only, not used. |
+| `test_obfuscator.py` | Stdlib-only round-trip + Lua 5.1 syntax tests (add `luaparser` for the parse checks). |
+| `test_lua_exec.py` | Executes obfuscated output in real Lua via `lupa` and compares behaviour to the original. |
 
 ## Commands
 
